@@ -1,220 +1,404 @@
-"""
-Bot utilities: HTTPX request wrapper with timeouts + semaphore and safe send wrappers for Telegram
+Asmodeus, [31/12/2025 16:34]
+import os
+import re
+import sqlite3
+import asyncio
+from datetime import datetime, date, timedelta
 
-This module provides:
-- HTTPXRequest: a small helper around httpx.Client that enforces timeouts, retries, and limits
-  concurrency with a semaphore to reduce httpx.ConnectTimeout errors.
-- safe_send_* wrappers: helpers to call telegram.Bot send/edit/delete methods while catching
-  telegram.error.TimedOut (and related transient errors) and retrying with exponential backoff.
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+import yt_dlp
 
-These helpers are intentionally conservative: they retry a few times with backoff and log
-failures rather than raising for every transient network hiccup.
-"""
+# ======================
+# KONFIGURASI (ISI ID SAJA)
+# ======================
 
-from __future__ import annotations
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # TOKEN DI RAILWAY
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))  # OWNER / SUPERUSER dari ENV (Railway)
 
-import logging
-import time
-import threading
-from typing import Any, Optional, Dict
+# channel IDs moved to environment variables
+TARGET_CHANNEL_ID = int(os.getenv("TARGET_CHANNEL_ID", "-1001234567890"))
+CHANNEL_LOG_ID = int(os.getenv("CHANNEL_LOG_ID", "-1001234567892"))
 
-import httpx
-import telegram
-from telegram.error import TimedOut, NetworkError
+MAX_FILE_MB = 50
 
-logger = logging.getLogger(__name__)
+# ======================
+# DATABASE
+# ======================
 
-# HTTPX configuration
-DEFAULT_CONNECT_TIMEOUT = 5.0
-DEFAULT_READ_TIMEOUT = 30.0
-DEFAULT_HTTP_TIMEOUT = httpx.Timeout(timeout=None, connect=DEFAULT_CONNECT_TIMEOUT, read=DEFAULT_READ_TIMEOUT)
-DEFAULT_HTTP_MAX_CONCURRENCY = 10
-DEFAULT_HTTP_MAX_RETRIES = 3
+conn = sqlite3.connect("database.db", check_same_thread=False)
+cur = conn.cursor()
 
-# Telegram safe-send configuration
-TELEGRAM_SEND_MAX_RETRIES = 3
-TELEGRAM_SEND_BACKOFF_BASE = 1.5  # multiplier for exponential backoff
+cur.execute("""
+CREATE TABLE IF NOT EXISTS limits (
+    user_id INTEGER,
+    type TEXT,
+    count INTEGER,
+    date TEXT
+)
+""")
 
+cur.execute("""
+CREATE TABLE IF NOT EXISTS welcome (
+    user_id INTEGER PRIMARY KEY
+)
+""")
 
-class HTTPXRequest:
-    """Lightweight httpx wrapper with timeouts, retries and a semaphore to limit concurrency.
+cur.execute("""
+CREATE TABLE IF NOT EXISTS chat_stats (
+    user_id INTEGER,
+    count INTEGER,
+    date TEXT
+)
+""")
 
-    Usage:
-        http = HTTPXRequest()
-        resp = http.get("https://example.com")
+conn.commit()
 
-    The wrapper will:
-    - limit concurrent requests using a threading.BoundedSemaphore
-    - retry on ConnectTimeout/ReadTimeout up to max_retries with exponential backoff
-    - surface other httpx.HTTPError exceptions
-    """
+# ======================
+# UTILITIES
+# ======================
 
-    def __init__(
-        self,
-        timeout: Optional[httpx.Timeout] = None,
-        max_concurrency: int = DEFAULT_HTTP_MAX_CONCURRENCY,
-        max_retries: int = DEFAULT_HTTP_MAX_RETRIES,
-    ) -> None:
-        self.timeout = timeout or DEFAULT_HTTP_TIMEOUT
-        self.client = httpx.Client(timeout=self.timeout)
-        # BoundedSemaphore prevents unlimited growth and Thundering Herd issues
-        self.semaphore = threading.BoundedSemaphore(max_concurrency)
-        self.max_retries = max_retries
+def is_link(text):
+    return bool(re.search(r"http[s]?://", text))
 
-    def _acquire(self, wait_timeout: Optional[float] = None) -> bool:
+def check_limit(user_id, limit_type, max_limit):
+    today = str(date.today())
+    cur.execute(
+        "SELECT count FROM limits WHERE user_id=? AND type=? AND date=?",
+        (user_id, limit_type, today),
+    )
+    row = cur.fetchone()
+
+    if row and row[0] >= max_limit:
+        return False
+
+    if row:
+        cur.execute(
+            "UPDATE limits SET count=count+1 WHERE user_id=? AND type=? AND date=?",
+            (user_id, limit_type, today),
+        )
+    else:
+        cur.execute(
+            "INSERT INTO limits VALUES (?, ?, 1, ?)",
+            (user_id, limit_type, today),
+        )
+
+    conn.commit()
+    return True
+
+async def log_event(bot, text):
+    await bot.send_message(chat_id=CHANNEL_LOG_ID, text=text)
+
+def add_chat_stat(user_id):
+    today = str(date.today())
+    cur.execute(
+        "SELECT count FROM chat_stats WHERE user_id=? AND date=?",
+        (user_id, today),
+    )
+    row = cur.fetchone()
+
+    if row:
+        cur.execute(
+            "UPDATE chat_stats SET count=count+1 WHERE user_id=? AND date=?",
+            (user_id, today),
+        )
+    else:
+        cur.execute(
+            "INSERT INTO chat_stats VALUES (?, 1, ?)",
+            (user_id, today),
+        )
+    conn.commit()
+
+# ======================
+# HELPERS: ADMIN CHECK (DARI GRUP)
+# ======================
+
+async def is_group_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+# ======================
+# MENFESS HANDLER
+# ======================
+
+async def menfess_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if msg is None:
+        return
+    user = msg.from_user
+    text = msg.text or msg.caption or ""
+
+    if "#pria" not in text and "#wanita" not in text:
+        await msg.reply_text("⚠️ Wajib sertakan #pria atau #wanita")
+        return
+
+    limit_type = "media" if msg.photo or msg.video else "text"
+    max_limit = 10 if limit_type == "media" else 5
+
+    if not check_limit(user.id, limit_type, max_limit):
+        await msg.reply_text("⛔️ Limit harian tercapai")
+        return
+
+    for target in (TARGET_CHANNEL_ID,):
         try:
-            return self.semaphore.acquire(timeout=wait_timeout)
+            await context.bot.copy_message(
+                chat_id=target,
+                from_chat_id=msg.chat_id,
+                message_id=msg.message_id,
+            )
         except Exception:
-            # As a fallback, try a blocking acquire
-            try:
-                self.semaphore.acquire()
-                return True
-            except Exception:
-                return False
+            # ignore copy errors per-target
+            pass
 
-    def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
-        """Make an HTTP request with retries and semaphore protection.
+    await log_event(
+        context.bot,
+        f"MENFESS\n"
+        f"Nama: {user.full_name}\n"
+        f"Username: @{user.username}\n"
+        f"ID: {user.id}\n"
+        f"Isi: {text[:200]}",
+    )
 
-        Raises httpx.HTTPError (or subclass) on persistent failures.
-        """
-        last_exc: Optional[Exception] = None
-        for attempt in range(1, self.max_retries + 1):
-            acquired = self._acquire(wait_timeout=10.0)
-            if not acquired:
-                logger.debug("HTTPXRequest: semaphore acquire timed out, waiting without timeout")
-                # Attempt a blocking acquire if timed out
-                self.semaphore.acquire()
-            try:
-                logger.debug("HTTPXRequest: %s %s (attempt %d/%d)", method.upper(), url, attempt, self.max_retries)
-                resp = self.client.request(method, url, **kwargs)
-                # Raise for 4xx/5xx so callers can decide to handle it
-                resp.raise_for_status()
-                return resp
+Asmodeus, [31/12/2025 16:34]
+await msg.reply_text("✅ Menfess berhasil dikirim")
 
-            except (httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
-                last_exc = exc
-                logger.warning(
-                    "HTTPX timeout (%s) for %s %s — attempt %d/%d",
-                    type(exc).__name__, method.upper(), url, attempt, self.max_retries,
-                )
-                # backoff before retrying
-                if attempt < self.max_retries:
-                    sleep_time = 2 ** (attempt - 1)
-                    logger.debug("Sleeping for %s seconds before retry", sleep_time)
-                    time.sleep(sleep_time)
-                    continue
-                else:
-                    logger.exception("Exceeded retries for HTTPX timeout while requesting %s %s", method, url)
-                    raise
+# ======================
+# DOWNLOAD HANDLER
+# ======================
 
-            except httpx.HTTPError as exc:
-                logger.exception("HTTPX error during request %s %s: %s", method.upper(), url, exc)
-                # Non-timeout httpx errors — re-raise to let callers handle
-                raise
+async def download_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+    user = update.message.from_user
 
-            finally:
-                # Ensure semaphore is released if we acquired it
+    if not context.args:
+        await update.message.reply_text("Gunakan: /dl <link>")
+        return
+
+    if not check_limit(user.id, "download", 2):
+        await update.message.reply_text("⛔️ Limit download harian habis")
+        return
+
+    url = context.args[0]
+
+    ydl_opts = {
+        "format": "best[height<=720]/best",
+        "outtmpl": "media.%(ext)s",
+        "quiet": True,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        for file in os.listdir():
+            if file.startswith("media."):
                 try:
-                    self.semaphore.release()
-                except ValueError:
-                    # release called more times than acquire — shouldn't happen, but ignore
-                    pass
+                    with open(file, "rb") as f:
+                        await update.message.reply_video(f)
+                except Exception:
+                    # fallback to sending as document if not a video or too large
+                    try:
+                        with open(file, "rb") as f:
+                            await update.message.reply_document(f)
+                    except Exception:
+                        await update.message.reply_text("❌ Gagal mengirim file hasil download")
+                finally:
+                    try:
+                        os.remove(file)
+                    except Exception:
+                        pass
 
-        # If we exit the loop, raise the last exception
-        assert last_exc is not None
-        raise last_exc
+                break
 
-    # convenience methods
-    def get(self, url: str, params: Optional[Dict[str, Any]] = None, **kwargs: Any) -> httpx.Response:
-        return self.request("GET", url, params=params, **kwargs)
+    except Exception:
+        await update.message.reply_text("❌ Gagal download")
 
-    def post(self, url: str, data: Any = None, json: Any = None, **kwargs: Any) -> httpx.Response:
-        return self.request("POST", url, data=data, json=json, **kwargs)
+# ======================
+# ANTI LINK GRUP
+# ======================
 
-    def close(self) -> None:
+async def antispam_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if msg is None:
+        return
+    user = msg.from_user
+
+    add_chat_stat(user.id)
+
+    # owner always allowed
+    if user.id == OWNER_ID:
+        return
+
+    # check if user is group admin
+    is_admin = False
+    try:
+        is_admin = await is_group_admin(context, msg.chat.id, user.id)
+    except Exception:
+        is_admin = False
+
+    if is_admin:
+        return
+
+    if is_link(msg.text or ""):
         try:
-            self.client.close()
+            await msg.delete()
         except Exception:
             pass
 
-
-def _retry_on_timedout(func, max_retries: int = TELEGRAM_SEND_MAX_RETRIES, backoff_base: float = TELEGRAM_SEND_BACKOFF_BASE):
-    """Internal helper to retry Telegram Bot methods on TimedOut/NetworkError.
-
-    func should be a zero-argument callable that performs the network operation.
-    """
-
-    last_exc: Optional[Exception] = None
-    for attempt in range(1, max_retries + 1):
         try:
-            return func()
-        except TimedOut as exc:
-            last_exc = exc
-            logger.warning("Telegram TimedOut on attempt %d/%d: %s", attempt, max_retries, exc)
-        except NetworkError as exc:
-            # NetworkError is often transient; treat similarly
-            last_exc = exc
-            logger.warning("Telegram NetworkError on attempt %d/%d: %s", attempt, max_retries, exc)
+            await context.bot.ban_chat_member(
+                chat_id=msg.chat_id,
+                user_id=user.id,
+                until_date=datetime.utcnow() + timedelta(hours=1),
+            )
+        except Exception:
+            pass
 
-        # only sleep/retry if we have more attempts left
-        if attempt < max_retries:
-            backoff = backoff_base ** attempt
-            logger.debug("Retrying Telegram call in %.2f seconds (attempt %d)", backoff, attempt + 1)
-            time.sleep(backoff)
+# ======================
+# WELCOME HANDLER
+# ======================
 
-    # Retries exhausted — re-raise the last exception for the caller to handle/log
-    logger.exception("Telegram send failed after %d attempts", max_retries)
-    raise last_exc
+async def welcome_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+    for member in update.message.new_chat_members:
+        cur.execute("SELECT user_id FROM welcome WHERE user_id=?", (member.id,))
+        if not cur.fetchone():
+            cur.execute("INSERT INTO welcome VALUES (?)", (member.id,))
+            conn.commit()
+            await update.message.reply_text(
+                f"👋 Selamat datang {member.full_name}\nSilakan baca rules."
+            )
 
+# ======================
+# ADMIN COMMAND: BAN & KICK
+# ======================
 
-# Public safe send wrappers
-def safe_send_message(bot: telegram.Bot, chat_id: int | str, text: str, **kwargs: Any) -> telegram.Message:
-    """Safely send a message with retries on TimedOut/NetworkError."""
+async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+    user = update.message.from_user
+    chat = update.message.chat
 
-    def _call():
-        return bot.send_message(chat_id=chat_id, text=text, **kwargs)
+    if chat.type == "private":
+        await update.message.reply_text("❌ Perintah ini hanya bisa di grup")
+        return
 
-    return _retry_on_timedout(_call)
+    # OWNER selalu boleh
+    if user.id != OWNER_ID:
+        is_admin = await is_group_admin(context, chat.id, user.id)
+        if not is_admin:
+            await update.message.reply_text("⛔️ Kamu bukan admin grup")
+            return
 
+    if not context.args:
+        await update.message.reply_text("Gunakan: /ban <user_id> [jam]")
+        return
 
-def safe_send_photo(bot: telegram.Bot, chat_id: int | str, photo: Any, **kwargs: Any) -> telegram.Message:
-    """Safely send a photo with retries on TimedOut/NetworkError."""
-
-    def _call():
-        return bot.send_photo(chat_id=chat_id, photo=photo, **kwargs)
-
-    return _retry_on_timedout(_call)
-
-
-def safe_edit_message_text(bot: telegram.Bot, chat_id: int | str, message_id: int, text: str, **kwargs: Any) -> telegram.Message:
-    """Safely edit a message's text with retries."""
-
-    def _call():
-        return bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, **kwargs)
-
-    return _retry_on_timedout(_call)
-
-
-def safe_delete_message(bot: telegram.Bot, chat_id: int | str, message_id: int) -> bool:
-    """Safely delete a message with retries."""
-
-    def _call():
-        return bot.delete_message(chat_id=chat_id, message_id=message_id)
-
-    return _retry_on_timedout(_call)
-
-
-# Expose a module-level HTTPX helper for convenience
-http = HTTPXRequest()
-
-
-# Example: if other modules import this file for helpers, they can use `http.get(...)` and the safe_send_* wrappers.
-
-if __name__ == "__main__":
-    # Basic smoke test for the module (not exhaustive)
-    logging.basicConfig(level=logging.DEBUG)
     try:
-        r = http.get("https://httpbin.org/get")
-        print("httpbin status:", r.status_code)
-    finally:
-        http.close()
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("ID tidak valid")
+        return
+
+    hours = int(context.args[1]) if len(context.args) > 1 else 1
+
+Asmodeus, [31/12/2025 16:34]
+try:
+        await context.bot.ban_chat_member(
+            chat_id=chat.id,
+            user_id=target_id,
+            until_date=datetime.utcnow() + timedelta(hours=hours),
+        )
+        await update.message.reply_text(f"✅ User diban {hours} jam")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Gagal ban: {e}")
+
+async def kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+    user = update.message.from_user
+    chat = update.message.chat
+
+    if chat.type == "private":
+        await update.message.reply_text("❌ Perintah ini hanya bisa di grup")
+        return
+
+    # OWNER selalu boleh
+    if user.id != OWNER_ID:
+        is_admin = await is_group_admin(context, chat.id, user.id)
+        if not is_admin:
+            await update.message.reply_text("⛔️ Kamu bukan admin grup")
+            return
+
+    if not context.args:
+        await update.message.reply_text("Gunakan: /kick <user_id>")
+        return
+
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("ID tidak valid")
+        return
+
+    try:
+        # ban then unban to simulate kick
+        await context.bot.ban_chat_member(chat_id=chat.id, user_id=target_id)
+        await context.bot.unban_chat_member(chat_id=chat.id, user_id=target_id)
+        await update.message.reply_text("✅ User dikick dari grup")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Gagal kick: {e}")
+
+# ======================
+# LEADERBOARD
+# ======================
+
+async def topchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+    today = str(date.today())
+    cur.execute(
+        "SELECT user_id, count FROM chat_stats WHERE date=? ORDER BY count DESC LIMIT 10",
+        (today,),
+    )
+    rows = cur.fetchall()
+
+    text = "🏆 TOP CHAT HARI INI\n\n"
+    for i, (uid, cnt) in enumerate(rows, 1):
+        text += f"{i}. ID {uid} → {cnt} pesan\n"
+
+    await update.message.reply_text(text)
+
+# ======================
+# MAIN
+# ======================
+
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN tidak diset di environment variables")
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("dl", download_handler))
+    app.add_handler(CommandHandler("ban", ban))
+    app.add_handler(CommandHandler("kick", kick))
+    app.add_handler(CommandHandler("topchat", topchat))
+
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE, menfess_handler))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_handler))
+    app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS, antispam_handler))
+
+    print("🤖 Bot berjalan...")
+    app.run_polling()
+
+if name == "main":
+    main()
