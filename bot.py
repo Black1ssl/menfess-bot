@@ -1,4 +1,3 @@
-Asmodeus, [31/12/2025 16:34]
 import os
 import re
 import sqlite3
@@ -168,7 +167,6 @@ async def menfess_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Isi: {text[:200]}",
     )
 
-Asmodeus, [31/12/2025 16:34]
 await msg.reply_text("✅ Menfess berhasil dikirim")
 
 # ======================
